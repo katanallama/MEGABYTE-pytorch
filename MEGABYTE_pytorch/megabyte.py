@@ -1,5 +1,6 @@
 import math
 import functools
+from itertools import zip_longest
 
 import torch
 import torch.nn.functional as F
@@ -7,6 +8,9 @@ from torch import nn, einsum
 
 from einops import rearrange, reduce, repeat, pack, unpack
 from einops.layers.torch import Rearrange
+
+from beartype import beartype
+from beartype.typing import Tuple, Union
 
 from MEGABYTE_pytorch.attend import Attend
 
@@ -62,40 +66,30 @@ def token_shift(t):
     t_shift = F.pad(t_shift, (0, 0, 1, -1))
     return torch.cat((t, t_shift), dim = -1)
 
-# positional bias
+# rotary positional embedding
 
-class Alibi(nn.Module):
-    def __init__(self, heads, **kwargs):
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, theta = 10000):
         super().__init__()
-        self.heads = heads
-        slopes = torch.Tensor(self._get_slopes(heads))
-        slopes = rearrange(slopes, 'h -> h 1 1')
-        self.register_buffer('slopes', slopes, persistent = False)
-        self.register_buffer('bias', None, persistent = False)
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
 
-    @staticmethod
-    def _get_slopes(heads):
-        def get_slopes_power_of_2(n):
-            start = (2**(-2**-(math.log2(n)-3)))
-            ratio = start
-            return [start*ratio**i for i in range(n)]
+    @property
+    def device(self):
+        return next(self.buffers()).device
 
-        if math.log2(heads).is_integer():
-            return get_slopes_power_of_2(heads)
+    def forward(self, seq_len):
+        t = torch.arange(seq_len, device = self.device).type_as(self.inv_freq)
+        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
+        freqs = torch.cat((freqs, freqs), dim = -1)
+        return freqs
 
-        closest_power_of_2 = 2 ** math.floor(math.log2(heads))
-        return get_slopes_power_of_2(closest_power_of_2) + get_slopes_power_of_2(2 * closest_power_of_2)[0::2][:heads-closest_power_of_2]
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
 
-    def forward(self, i, j, device):
-        if exists(self.bias) and self.bias.shape[-1] >= j:
-            return self.bias[..., :j]
-
-        bias = torch.arange(j, device = device)
-        bias = rearrange(bias, 'j -> 1 1 j')
-        bias = bias * self.slopes
-
-        self.register_buffer('bias', bias, persistent = False)
-        return self.bias
+def apply_rotary_pos_emb(pos, t):
+    return t * pos.cos() + rotate_half(t) * pos.sin()
 
 # norm
 
@@ -148,14 +142,17 @@ class Attention(nn.Module):
         self.to_kv = nn.Linear(dim, dim_head * 2, bias = False)
         self.to_out = nn.Linear(inner_dim, dim, bias = False)
 
-    def forward(self, x, attn_bias = None):
+    def forward(self, x, rotary_emb = None):
         h, device = self.heads, x.device
 
         x = self.norm(x)
         q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim = -1))
         q = rearrange(q, 'b n (h d) -> b h n d', h = h)
 
-        out = self.attend(q, k, v, attn_bias = attn_bias)
+        if exists(rotary_emb):
+            q, k = map(lambda t: apply_rotary_pos_emb(rotary_emb, t), (q, k))
+
+        out = self.attend(q, k, v)
 
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
@@ -171,11 +168,11 @@ class Transformer(nn.Module):
         attn_dropout = 0.,
         ff_dropout = 0.,
         ff_mult = 4,
-        rel_pos_bias = True,
+        rel_pos = True,
         flash_attn = False
     ):
         super().__init__()
-        self.alibi = Alibi(heads = heads) if rel_pos_bias else None
+        self.rotary_emb = RotaryEmbedding(dim_head) if rel_pos else None
         self.layers = nn.ModuleList([])
 
         for _ in range(layers):
@@ -188,10 +185,10 @@ class Transformer(nn.Module):
 
     def forward(self, x):
         n = x.shape[-2]
-        attn_bias = self.alibi(n, n, device = x.device) if exists(self.alibi) else None
+        rotary_emb = self.rotary_emb(n) if exists(self.rotary_emb) else None
 
         for attn, ff in self.layers:
-            x = attn(token_shift(x), attn_bias = attn_bias) + x
+            x = attn(token_shift(x), rotary_emb = rotary_emb) + x
             x = ff(token_shift(x)) + x
 
         return self.norm(x)
@@ -199,20 +196,23 @@ class Transformer(nn.Module):
 # main class
 
 class MEGABYTE(nn.Module):
+
+    @beartype
     def __init__(
         self,
         *,
         num_tokens,
-        dim,
-        depth,
-        max_seq_len,
+        dim: Union[Tuple, int],
+        depth: Tuple,
+        max_seq_len: Tuple,
         dim_head = 64,
         heads = 8,
         attn_dropout = 0.,
         ff_mult = 4,
         ff_dropout = 0.,
         pad_id = 0,
-        rel_pos_bias = True,
+        rel_pos = False,
+        pos_emb = False,
         flash_attn = False
     ):
         super().__init__()
@@ -225,37 +225,61 @@ class MEGABYTE(nn.Module):
         assert len(depth) == len(max_seq_len)
 
         self.stages = len(depth)
+        dim = cast_tuple(dim, self.stages)
 
-        self.token_emb = nn.Embedding(num_tokens, dim)
-        self.start_tokens = nn.Parameter(torch.randn(dim))
+        assert len(dim) == self.stages
+
+        coarsest_dim, *_, fine_dim = dim
 
         self.max_seq_len = max_seq_len
 
-        self.pos_embs = nn.ModuleList([nn.Embedding(seq_len, dim) for seq_len in max_seq_len])
+        self.start_tokens = nn.ParameterList([nn.Parameter(torch.randn(h_dim)) for h_dim, seq_len in zip(dim, max_seq_len)])
+        self.pos_embs = nn.ModuleList([nn.Embedding(seq_len, h_dim) for h_dim, seq_len in zip(dim, max_seq_len)]) if pos_emb else None
 
-        self.patch_embedders = nn.ModuleList([nn.Sequential(
-            Rearrange('... r d -> ... (r d)'),
-            nn.LayerNorm(seq_len * dim),
-            nn.Linear(seq_len * dim, dim),
-            nn.LayerNorm(dim)
-        ) for seq_len in self.max_seq_len[1:]])
+        self.token_embs = nn.ModuleList([])
+
+        patch_size = 1
+        self.token_embs.append(nn.Embedding(num_tokens, fine_dim))
+
+        for dim_out, seq_len in zip(reversed(dim[:-1]), reversed(max_seq_len[1:])):
+            patch_size *= seq_len
+
+            self.token_embs.append(nn.Sequential(
+                nn.Embedding(num_tokens, fine_dim),
+                Rearrange('... r d -> ... (r d)'),
+                nn.LayerNorm(patch_size * fine_dim),
+                nn.Linear(patch_size * fine_dim, dim_out),
+                nn.LayerNorm(dim_out)
+            ))
 
         self.transformers = nn.ModuleList([])
+        self.to_next_transformer_projections = nn.ModuleList([])
 
-        for stage_depth in depth:
+        for h_dim, next_h_dim, stage_depth, next_seq_len in zip_longest(dim, dim[1:], depth, max_seq_len[1:]):
             self.transformers.append(Transformer(
-                dim = dim,
+                dim = h_dim,
                 layers = stage_depth,
                 dim_head = dim_head,
                 heads = heads,
                 attn_dropout = attn_dropout,
                 ff_dropout = ff_dropout,
                 ff_mult = ff_mult,
-                rel_pos_bias = rel_pos_bias,
+                rel_pos = rel_pos,
                 flash_attn = flash_attn
             ))
 
-        self.to_logits = nn.Linear(dim, num_tokens)
+            proj = nn.Identity()
+
+            if exists(next_h_dim) and next_h_dim != dim:
+                proj = nn.Sequential(
+                    Rearrange('b ... d -> b (...) d'),
+                    nn.Linear(h_dim, next_h_dim * next_seq_len),
+                    Rearrange('b m (n d) -> (b m) n d', n = next_seq_len)
+                )
+
+            self.to_next_transformer_projections.append(proj)
+
+        self.to_logits = nn.Linear(fine_dim, num_tokens)
         self.pad_id = pad_id
 
     def generate(self, prime = None, filter_thres = 0.9, temperature = 1., default_batch_size = 1):
@@ -280,10 +304,16 @@ class MEGABYTE(nn.Module):
         # take care of special case
         # where you sample from input of 0 (start token only)
 
-        tokens = repeat(self.start_tokens, 'd -> b 1 d', b = batch_size)
+        prev_stage_tokens_repr = None
 
-        for transformer in self.transformers:
+        for stage_start_tokens, transformer, proj in zip(self.start_tokens, self.transformers, self.to_next_transformer_projections):
+            tokens = repeat(stage_start_tokens, 'd -> b 1 d', b = batch_size)
+
+            if exists(prev_stage_tokens_repr):
+                tokens = tokens + prev_stage_tokens_repr[..., :tokens.shape[-2], :]
+
             tokens = transformer(tokens)
+            prev_stage_tokens_repr = proj(tokens)
 
         return self.to_logits(tokens)
 
@@ -313,64 +343,85 @@ class MEGABYTE(nn.Module):
         assert prec_dims[0] <= self.max_seq_len[0], 'the first dimension of your axial autoregressive transformer must be less than the first tuple element of max_seq_len (like any autoregressive transformer)'
         assert tuple(prec_dims[1:]) == tuple(self.max_seq_len[1:]), 'all subsequent dimensions must match exactly'
 
-        # get token embeddings
-
-        tokens = self.token_emb(ids)
-
         # get tokens for all hierarchical stages, reducing by appropriate dimensions
         # and adding the absolute positional embeddings
 
         tokens_at_stages = []
-        reduced_tokens = tokens
+        pos_embs = default(self.pos_embs, (None,))
 
-        for ind, pos_emb, patch_emb in zip(range(len(prec_dims)), reversed(self.pos_embs), reversed((*self.patch_embedders, None))):
+        for ind, pos_emb, token_emb in zip_longest(range(len(prec_dims)), pos_embs, self.token_embs):
             is_first = ind == 0
 
-            if not is_first:
-                reduced_tokens = patch_emb(reduced_tokens)
+            tokens = token_emb(ids)
 
-            positions = pos_emb(torch.arange(reduced_tokens.shape[-2], device = device))
-            tokens_with_position = reduced_tokens + positions
-            tokens_at_stages.insert(0, tokens_with_position)
+            if exists(pos_emb):
+                positions = pos_emb(torch.arange(tokens.shape[-2], device = device))
+                tokens = tokens + positions
 
-        # get start tokens and append to the coarsest stage
+            tokens_at_stages.insert(0, tokens)
 
-        start_tokens = repeat(self.start_tokens, 'f -> b 1 f', b = b)
+            if is_first:
+                continue
+
+            ids = rearrange(ids, '... m n -> ... (m n)')
+
+        # the un-pixelshuffled representations of the previous hierarchy, starts with None
+
+        prev_stage_tokens_repr = None
 
         # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions        
 
-        for ind, (stage_tokens, transformer) in enumerate(zip(tokens_at_stages, self.transformers)):
-            is_last = ind == (self.stages - 1)
+        for stage_start_tokens, stage_tokens, transformer, proj in zip(self.start_tokens, tokens_at_stages, self.transformers, self.to_next_transformer_projections):
+            stage_tokens, ps = pack_one(stage_tokens, '* n d')
+            stage_start_tokens = repeat(stage_start_tokens, 'f -> b 1 f', b = stage_tokens.shape[0])
+
+            # concat start token
 
             stage_tokens = torch.cat((
-                start_tokens,
+                stage_start_tokens,
                 stage_tokens,
             ), dim = -2)
 
-            stage_tokens, ps = pack_one(stage_tokens, '* n d')
+            # sum the previous hierarchy's representation
+
+            if exists(prev_stage_tokens_repr):
+                prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value = 0.)
+                stage_tokens = stage_tokens + prev_stage_tokens_repr
+
             attended = transformer(stage_tokens)
+
             attended = unpack_one(attended, ps, '* n d')
 
-            start_tokens = rearrange(attended[..., :-1, :], '... n d -> ... n 1 d')
+            # project for next stage in the hierarchy
+
+            prev_stage_tokens_repr = proj(attended[..., :-1, :])
+
+        # project to logits
 
         logits = self.to_logits(attended)
+
+        start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
+        start_tokens = rearrange(start_tokens, 'b d -> b 1 d')
 
         logits = logits[..., 1:, :]
 
         if not return_loss:
 
             if flattened_dims:
-                logits = rearrange(logits, 'b ... n -> b (...) n')
+                logits = rearrange(logits, 'b ... c -> b (...) c')
                 logits = logits[:, :seq_len]
 
             return logits
 
-        preds = rearrange(logits, 'b ... c -> b c (...)')
+        logits = rearrange(logits, 'b ... c -> b (...) c')
+        logits = torch.cat((start_tokens, logits), dim = -2)
+
+        preds = rearrange(logits, 'b n c -> b c n')
         labels = rearrange(ids, 'b ... -> b (...)')
 
         loss = F.cross_entropy(
             preds[..., :-1],
-            labels[..., 1:],
+            labels,
             ignore_index = self.pad_id
         )
 

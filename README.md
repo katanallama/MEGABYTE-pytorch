@@ -24,7 +24,7 @@ from MEGABYTE_pytorch import MEGABYTE
 
 model = MEGABYTE(
     num_tokens = 16000,             # number of tokens
-    dim = 512,                      # transformer model dimension
+    dim = (512, 256),               # transformer model dimension (512 for coarsest, 256 for fine in this example)
     max_seq_len = (1024, 4),        # sequence length for global and then local. this can be more than 2
     depth = (6, 4),                 # number of layers for global and then local. this can be more than 2, but length must match the max_seq_len's
     dim_head = 64,                  # dimension per head
@@ -49,7 +49,7 @@ sampled = model.generate(temperature = 0.9, filter_thres = 0.9) # (1, 1024, 4)
 
 ## Test
 
-Train on character-level enwik8 with patches of size 4
+Train on character-level enwik8 with patches of size 4 - length 8192
 
 ```bash
 $ python train.py
@@ -90,15 +90,6 @@ $ python train.py
 ```
 
 ```bibtex
-@misc{press2021ALiBi,
-    title   = {Train Short, Test Long: Attention with Linear Biases Enable Input Length Extrapolation},
-    author  = {Ofir Press and Noah A. Smith and Mike Lewis},
-    year    = {2021},
-    url     = {https://ofir.io/train_short_test_long.pdf}
-}
-```
-
-```bibtex
 @software{peng_bo_2021_5196578,
     author    = {PENG Bo},
     title     = {BlinkDL/RWKV-LM: 0.01},
@@ -108,5 +99,26 @@ $ python train.py
     version   = {0.01},
     doi       = {10.5281/zenodo.5196578},
     url       = {https://doi.org/10.5281/zenodo.5196578}
+}
+```
+
+```bibtex
+@article{Kazemnejad2023TheIO,
+    title   = {The Impact of Positional Encoding on Length Generalization in Transformers},
+    author  = {Amirhossein Kazemnejad and Inkit Padhi and Karthikeyan Natesan Ramamurthy and Payel Das and Siva Reddy},
+    journal = {ArXiv},
+    year    = {2023},
+    volume  = {abs/2305.19466}
+}
+```
+
+```bibtex
+@misc{su2021roformer,
+    title   = {RoFormer: Enhanced Transformer with Rotary Position Embedding},
+    author  = {Jianlin Su and Yu Lu and Shengfeng Pan and Bo Wen and Yunfeng Liu},
+    year    = {2021},
+    eprint  = {2104.09864},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL}
 }
 ```
